@@ -2,11 +2,17 @@
 #
 # pmoiu — PostmarketOS in Ubuntu (installer)
 #
-# Installs a mobile Linux shell (Plasma Mobile or Phosh) on a regular
-# Ubuntu box, wires it up to a remote-access backend of your choice
-# (KasmVNC, noVNC, or RDP), and drops a "pmos" launcher in
-# /usr/local/bin that starts the session + server headlessly (no
-# physical display needed — works fine over plain SSH).
+# Installs a mobile Linux shell (Plasma Mobile or Phosh) plus a
+# remote-access backend (KasmVNC, noVNC, or RDP), and drops a "pmos"
+# launcher in /usr/local/bin that starts the session + server
+# headlessly (no physical display needed — works fine over plain SSH).
+#
+# Despite the name this also runs on Debian, Fedora, and Arch — it
+# detects apt/dnf/pacman and adjusts package names accordingly. Ubuntu
+# and Debian get the most testing; plasma-mobile and phosh are niche
+# packages on Fedora/Arch (often COPR/AUR rather than the main repos),
+# so on those distros the script tells you plainly if a package isn't
+# found instead of guessing a name that doesn't exist.
 #
 # ---------------------------------------------------------------------
 # READ THIS FIRST — compatibility reality check
@@ -44,7 +50,7 @@ RDP_PORT=3389
 
 require_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo "pmoiu needs root to install packages." >&2
+        echo "pmoiu needs root to install packages. Re-run as: sudo" >&2
         exit 1
     fi
 }
@@ -69,13 +75,54 @@ choose() {
     done
 }
 
+detect_pkgmgr() {
+    if command -v apt-get &>/dev/null; then
+        PKG_MGR=apt
+    elif command -v dnf &>/dev/null; then
+        PKG_MGR=dnf
+    elif command -v pacman &>/dev/null; then
+        PKG_MGR=pacman
+    else
+        echo "Couldn't find apt, dnf, or pacman. Unsupported distro." >&2
+        exit 1
+    fi
+}
+
+pkg_update() {
+    case "$PKG_MGR" in
+        apt)    apt-get update ;;
+        dnf)    dnf makecache ;;
+        pacman) pacman -Sy ;;
+    esac
+}
+
+pkg_install() {
+    # pkg_install pkg1 pkg2 ... — returns non-zero if any package is
+    # genuinely missing from the repos (as opposed to already installed).
+    case "$PKG_MGR" in
+        apt)    apt-get install -y "$@" ;;
+        dnf)    dnf install -y "$@" ;;
+        pacman) pacman -S --needed --noconfirm "$@" ;;
+    esac
+}
+
+pkg_available() {
+    # pkg_available pkgname — true if the repos actually have it
+    case "$PKG_MGR" in
+        apt)    apt-cache show "$1" &>/dev/null ;;
+        dnf)    dnf info "$1" &>/dev/null ;;
+        pacman) pacman -Si "$1" &>/dev/null ;;
+    esac
+}
+
 # --------------------------------------------------------------------
 # 1. ask what to install
 # --------------------------------------------------------------------
 
 require_root
+detect_pkgmgr
 
-echo "=== pmoiu — install a mobile shell on Ubuntu ==="
+echo "=== pmoiu — install a mobile shell ($PKG_MGR detected) ==="
 echo
 echo "Which mobile shell do you want?"
 choose DESKTOP "plasma-mobile" "phosh"
@@ -133,27 +180,52 @@ if [[ "$INTERFACE" == "novnc" ]]; then
 fi
 
 # --------------------------------------------------------------------
-# 4. base tools + apt update
+# 4. base tools
 # --------------------------------------------------------------------
 
-apt-get update
-apt-get install -y curl wget gnupg openssl python3
+pkg_update
+pkg_install curl wget gnupg openssl python3
 
 # --------------------------------------------------------------------
 # 5. install the desktop shell
 # --------------------------------------------------------------------
+#
+# Package names/availability here are solid on Ubuntu/Debian. On
+# Fedora and Arch, plasma-mobile and phosh are niche — if pkg_install
+# fails, that almost always means the distro doesn't carry it in its
+# main repos and you'll need a COPR (Fedora) or the AUR (Arch)
+# instead. The script tells you rather than pretending it worked.
 
 install_desktop() {
     case "$DESKTOP" in
         plasma-mobile)
-            apt-get install -y plasma-mobile kwin-wayland-backend-virtual
+            case "$PKG_MGR" in
+                apt)    pkg_install plasma-mobile kwin-wayland-backend-virtual || return 1 ;;
+                dnf)    pkg_install plasma-mobile kwin || return 1 ;;
+                pacman) pkg_install plasma-mobile kwin || return 1 ;;
+            esac
             ;;
         phosh)
-            apt-get install -y phosh phosh-core phoc squeekboard
+            case "$PKG_MGR" in
+                apt)        pkg_install phosh phosh-core phoc squeekboard || return 1 ;;
+                dnf|pacman) pkg_install phosh phoc squeekboard || return 1 ;;
+            esac
             ;;
     esac
+    return 0
 }
-install_desktop
+if ! install_desktop; then
+    cat <<EOF
+
+Couldn't install $DESKTOP via $PKG_MGR — it isn't in the standard
+repos for this distro/release. On Fedora, look for a plasma-mobile or
+phosh COPR. On Arch, check the AUR (e.g. 'yay -S plasma-mobile' or
+'yay -S phosh'). On Ubuntu/Debian, check you're on a release recent
+enough to carry it (see https://packages.ubuntu.com or
+https://packages.debian.org).
+EOF
+    exit 1
+fi
 
 # --------------------------------------------------------------------
 # 6. install the remote-access backend
@@ -164,31 +236,55 @@ install_kasmvnc() {
         echo "kasmvncserver already installed."
         return
     fi
-    # KasmVNC isn't in Ubuntu's repos — pull the matching .deb from
-    # their GitHub releases automatically.
-    local codename arch asset_url
-    codename=$(lsb_release -cs)
-    arch=$(dpkg --print-architecture)
-    echo "Looking up the latest KasmVNC release for $codename/$arch..."
-    asset_url=$(curl -fsSL https://api.github.com/repos/kasmtech/KasmVNC/releases/latest \
-        | grep -oP '"browser_download_url":\s*"\K[^"]*\.deb' \
-        | grep -i "$codename" | grep -i "$arch" | head -n1 || true)
-    if [[ -z "$asset_url" ]]; then
-        echo "Couldn't auto-detect a matching .deb on the KasmVNC releases page"
-        echo "(https://github.com/kasmtech/KasmVNC/releases)."
-        echo "Download the right one for $codename/$arch manually, install it"
-        echo "with 'dpkg -i', then re-run pmoiu."
-        exit 1
-    fi
-    wget -O /tmp/kasmvncserver.deb "$asset_url"
-    apt-get install -y /tmp/kasmvncserver.deb
+    case "$PKG_MGR" in
+        apt)
+            local codename arch asset_url
+            codename=$(lsb_release -cs)
+            arch=$(dpkg --print-architecture)
+            echo "Looking up the latest KasmVNC .deb for $codename/$arch..."
+            asset_url=$(curl -fsSL https://api.github.com/repos/kasmtech/KasmVNC/releases/latest \
+                | grep -oP '"browser_download_url":\s*"\K[^"]*\.deb' \
+                | grep -i "$codename" | grep -i "$arch" | head -n1 || true)
+            if [[ -z "$asset_url" ]]; then
+                echo "Couldn't auto-detect a matching .deb on the KasmVNC releases"
+                echo "page (https://github.com/kasmtech/KasmVNC/releases). Grab one"
+                echo "manually and install with 'dpkg -i', then re-run pmoiu."
+                exit 1
+            fi
+            wget -O /tmp/kasmvncserver.deb "$asset_url"
+            apt-get install -y /tmp/kasmvncserver.deb
+            ;;
+        dnf)
+            local arch asset_url
+            arch=$(uname -m)
+            echo "Looking up the latest KasmVNC .rpm for $arch..."
+            asset_url=$(curl -fsSL https://api.github.com/repos/kasmtech/KasmVNC/releases/latest \
+                | grep -oP '"browser_download_url":\s*"\K[^"]*\.rpm' \
+                | grep -i "$arch" | head -n1 || true)
+            if [[ -z "$asset_url" ]]; then
+                echo "Couldn't auto-detect a matching .rpm on the KasmVNC releases"
+                echo "page (https://github.com/kasmtech/KasmVNC/releases). Grab one"
+                echo "manually and install with 'dnf install ./file.rpm', then"
+                echo "re-run pmoiu."
+                exit 1
+            fi
+            wget -O /tmp/kasmvncserver.rpm "$asset_url"
+            dnf install -y /tmp/kasmvncserver.rpm
+            ;;
+        pacman)
+            echo "KasmVNC isn't in the official Arch repos — it's on the AUR as"
+            echo "'kasmvnc' or 'kasmvnc-bin'. Install it yourself first (e.g."
+            echo "'yay -S kasmvnc-bin'), then re-run pmoiu."
+            exit 1
+            ;;
+    esac
     echo
     echo "Set the KasmVNC password for $VNC_USER now:"
     as_user "kasmvncpasswd"
 }
 
 install_novnc() {
-    apt-get install -y wayvnc novnc
+    pkg_install wayvnc novnc
     as_user "mkdir -p '$REAL_HOME/.config/wayvnc'"
     as_user "cat > '$REAL_HOME/.config/wayvnc/config' <<CFG
 address=0.0.0.0
@@ -200,7 +296,52 @@ CFG"
 }
 
 install_rdp() {
-    apt-get install -y krdp
+    case "$PKG_MGR" in
+        apt)
+            if ! pkg_available krdp; then
+                cat <<EOF
+
+krdp isn't in this Ubuntu/Debian release's repos. It needs Plasma 6,
+and Ubuntu 24.04/22.04 (and Debian bookworm) ship Plasma 5 by
+default. krdp only lands starting with Ubuntu 25.04 (or Debian
+trixie+). Two ways forward:
+
+EOF
+                choose PPA_FIX \
+                    "Add the Kubuntu Backports PPA to get Plasma 6 + krdp (Ubuntu only — upgrades your whole KDE/Plasma stack, can take a while)" \
+                    "Skip RDP — use novnc instead (works today, no stack upgrade)" \
+                    "Abort"
+                case "$PPA_FIX" in
+                    "Add the Kubuntu"*)
+                        if ! command -v lsb_release &>/dev/null || [[ "$(lsb_release -is)" != "Ubuntu" ]]; then
+                            echo "This PPA is Ubuntu-only. On Debian, add the KDE backports"
+                            echo "suite for your release, or install Debian trixie+/sid,"
+                            echo "then re-run pmoiu."
+                            exit 1
+                        fi
+                        pkg_install software-properties-common
+                        add-apt-repository -y ppa:kubuntu-ppa/backports
+                        apt-get update
+                        echo "Upgrading Plasma packages — this can take a while..."
+                        apt-get full-upgrade -y
+                        ;;
+                    "Skip RDP"*)
+                        INTERFACE=novnc
+                        install_novnc
+                        return
+                        ;;
+                    "Abort") exit 1 ;;
+                esac
+            fi
+            pkg_install krdp
+            ;;
+        dnf|pacman)
+            # krdp is a normal, current package on Fedora and Arch since
+            # they ship Plasma 6 already.
+            pkg_install krdp
+            ;;
+    esac
+
     local krdp_dir="$REAL_HOME/.local/share/krdpserver"
     as_user "mkdir -p '$krdp_dir'"
     as_user "openssl req -nodes -new -x509 \
