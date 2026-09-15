@@ -1,31 +1,36 @@
 #!/usr/bin/env bash
 #
-# pmoiu — Headless Mobile Shell Installer
-# Tested on: Ubuntu 24.04 LTS, GitHub Codespaces, plain SSH
+# pmoiu — PostmarketOS in Ubuntu (installer)
 #
-# Supported combinations on Ubuntu 24.04:
+# Installs a mobile Linux shell (Plasma Mobile or Phosh) plus a
+# remote-access backend (KasmVNC, noVNC, or RDP), and drops a "pmos"
+# launcher in /usr/local/bin that starts the session + server
+# headlessly (no physical display needed — works fine over plain SSH).
 #
-#   phosh + novnc
-#     phoc (wlroots compositor, headless backend) +
-#     wayvnc (attaches to wlroots screencopy) +
-#     websockify + noVNC web client
-#     → Works reliably. Recommended choice.
+# Despite the name this also runs on Debian, Fedora, and Arch — it
+# detects apt/dnf/pacman and adjusts package names accordingly. Ubuntu
+# and Debian get the most testing; plasma-mobile and phosh are niche
+# packages on Fedora/Arch (often COPR/AUR rather than the main repos),
+# so on those distros the script tells you plainly if a package isn't
+# found instead of guessing a name that doesn't exist.
 #
-#   plasma-desktop + novnc  (X11 path, not "plasma-mobile")
-#     Xvfb (fake framebuffer) + kwin_x11 + plasmashell +
-#     x11vnc (captures the Xvfb framebuffer) +
-#     websockify + noVNC web client
-#     → Works on Ubuntu 24.04 without any PPA.
-#     → "plasma-mobile" the package doesn't exist in Ubuntu 24.04
-#       repos so we use standard Plasma desktop instead.
+# ---------------------------------------------------------------------
+# READ THIS FIRST — compatibility reality check
+# ---------------------------------------------------------------------
+# Plasma Mobile runs on KWin. KWin does NOT implement the wlroots
+# screencopy/virtual-input protocols that wayvnc and KasmVNC's Wayland
+# capture rely on (there's an open KDE feature request to add the
+# replacement protocol, ext-image-copy-capture-v1, but it isn't
+# shipped yet). The only remote-access method that reliably works with
+# Plasma Mobile today is RDP, via KWin's own KRDP server.
 #
-# What was removed and why:
-#   squeekboard  — not packaged for Ubuntu (Fedora / postmarketOS only)
-#   krdp         — requires Plasma 6; Ubuntu 24.04 ships Plasma 5
-#   kasmvnc      — GitHub .deb may not match noble; left as manual option
-#   wlroots VNC on KWin — KWin doesn't implement screencopy; broken
+# Phosh runs on phoc, a wlroots-based compositor, so wayvnc/KasmVNC/
+# noVNC all work fine there. Phosh has nothing equivalent to KRDP, so
+# there's no solid native RDP path for it.
 #
-# Usage:  sudo ./pmoiu
+# This script will NOT silently let you pick a combo that's known not
+# to work — it warns you and offers to switch to the supported option.
+# ---------------------------------------------------------------------
 
 set -euo pipefail
 
@@ -34,602 +39,515 @@ REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 CONFIG_DIR="/etc/pmoiu"
 CONFIG_FILE="$CONFIG_DIR/config"
 PMOS_BIN="/usr/local/bin/pmos"
+NOVNC_SHARE_DIR="/usr/share/novnc"
 VNC_PORT=5900
 NOVNC_PORT=6080
+RDP_PORT=3389
 
-# ────────────────────────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------
 
-die()        { echo "ERROR: $*" >&2; exit 1; }
-require_root() { [[ $EUID -eq 0 ]] || die "Run with sudo: sudo $0"; }
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "pmoiu needs root to install packages. Re-run as: sudo ./pmoiu" >&2
+        exit 1
+    fi
+}
 
 as_user() {
-    # Run a command as the non-root invoking user
+    # run a command as the real (non-root) user who invoked sudo
     sudo -u "$REAL_USER" -H bash -c "$*"
 }
 
 choose() {
-    # choose VARNAME "opt1" "opt2" ...
-    local __var=$1; shift
+    # choose RESULT_VAR "option1" "option2" ...
+    local __resultvar=$1; shift
     local opt
     PS3="Choice: "
     select opt in "$@"; do
-        [[ -n "${opt:-}" ]] && { printf -v "$__var" '%s' "$opt"; break; }
-        echo "Invalid selection, try again."
-    done
-}
-
-apt_has() {
-    # Returns 0 if apt knows about the package (even if not installed)
-    apt-cache show "$1" &>/dev/null
-}
-
-apt_get() {
-    # Hard install — dies on failure
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
-}
-
-apt_get_optional() {
-    # Soft install — skips packages not found in repos, never dies
-    local pkg ok=()
-    for pkg in "$@"; do
-        if apt_has "$pkg"; then
-            ok+=("$pkg")
+        if [[ -n "${opt:-}" ]]; then
+            printf -v "$__resultvar" '%s' "$opt"
+            break
         else
-            echo "  [skip] '$pkg' is not in the Ubuntu 24.04 repos — omitting"
+            echo "Invalid choice, try again."
         fi
     done
-    if [[ ${#ok[@]} -gt 0 ]]; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y "${ok[@]}"
+}
+
+detect_pkgmgr() {
+    if command -v apt-get &>/dev/null; then
+        PKG_MGR=apt
+    elif command -v dnf &>/dev/null; then
+        PKG_MGR=dnf
+    elif command -v pacman &>/dev/null; then
+        PKG_MGR=pacman
+    else
+        echo "Couldn't find apt, dnf, or pacman. Unsupported distro." >&2
+        exit 1
     fi
 }
 
-# ────────────────────────────────────────────────────────────────────
-# 0. Sanity checks
-# ────────────────────────────────────────────────────────────────────
+pkg_update() {
+    case "$PKG_MGR" in
+        apt)    apt-get update ;;
+        dnf)    dnf makecache ;;
+        pacman) pacman -Sy ;;
+    esac
+}
+
+pkg_install() {
+    # pkg_install pkg1 pkg2 ... — returns non-zero if any package is
+    # genuinely missing from the repos (as opposed to already installed).
+    case "$PKG_MGR" in
+        apt)    apt-get install -y "$@" ;;
+        dnf)    dnf install -y "$@" ;;
+        pacman) pacman -S --needed --noconfirm "$@" ;;
+    esac
+}
+
+pkg_available() {
+    # pkg_available pkgname — true if the repos actually have it
+    case "$PKG_MGR" in
+        apt)    apt-cache show "$1" &>/dev/null ;;
+        dnf)    dnf info "$1" &>/dev/null ;;
+        pacman) pacman -Si "$1" &>/dev/null ;;
+    esac
+}
+
+# --------------------------------------------------------------------
+# 1. ask what to install
+# --------------------------------------------------------------------
 
 require_root
+detect_pkgmgr
 
-# This script is written specifically for apt/Ubuntu/Debian
-if ! command -v apt-get &>/dev/null; then
-    die "This script requires apt-get (Ubuntu / Debian). \
-For Fedora use dnf; for Arch use pacman — see the comments at the top."
-fi
-
-UBUNTU_VER=$(lsb_release -rs 2>/dev/null || echo "unknown")
-echo "Detected Ubuntu $UBUNTU_VER"
-
-# ────────────────────────────────────────────────────────────────────
-# 1. Choose what to install
-# ────────────────────────────────────────────────────────────────────
-
-echo
-echo "=== pmoiu — Headless Mobile Shell Installer ==="
+echo "=== pmoiu — install a mobile shell ($PKG_MGR detected) ==="
 echo
 echo "Which mobile shell do you want?"
-echo "  phosh         — Phosh/phoc (wlroots, native Wayland VNC, recommended)"
-echo "  plasma-desktop — KDE Plasma via Xvfb+x11vnc (no krdp needed)"
-echo
-choose DESKTOP "phosh" "plasma-desktop"
+choose DESKTOP "plasma-mobile" "phosh"
 
 echo
-echo "Remote access interface:"
-echo "  novnc — browser-based VNC client (works for both shells above)"
-echo
-# Only one real option but keep the select in case we extend later
-choose INTERFACE "novnc"
+echo "Which remote-access method do you want to interface it with?"
+choose INTERFACE "kasmvnc" "novnc" "rdp"
+
+# --------------------------------------------------------------------
+# 2. compatibility check — see the header comment for why
+# --------------------------------------------------------------------
+
+if [[ "$INTERFACE" == "kasmvnc" ]]; then
+    cat <<EOF
+
+WARNING: KasmVNC's normal mode of operation ('vncserver') starts and
+manages its OWN X11 desktop session (like classic TigerVNC) — it does
+not attach to an already-running Wayland compositor. That means it
+won't show you the plasma-mobile/phosh session at all; it'll just
+give you a separate, unrelated X desktop. wayvnc (the novnc option
+here) is the one that actually attaches to a running Wayland session.
+
+EOF
+    choose KASM_FIX "Switch to novnc (recommended — actually shows the mobile session)" "Continue with kasmvnc anyway (separate X session, not the mobile shell)" "Abort"
+    case "$KASM_FIX" in
+        "Switch to novnc"*) INTERFACE="novnc" ;;
+        "Continue"*) : ;;
+        "Abort") exit 1 ;;
+    esac
+fi
+
+if [[ "$DESKTOP" == "plasma-mobile" && "$INTERFACE" != "rdp" ]]; then
+    cat <<EOF
+
+WARNING: Plasma Mobile's compositor (KWin) does not support the
+wlroots screencopy protocol that $INTERFACE depends on. $INTERFACE
+will very likely fail to capture anything on Plasma Mobile — it will
+start, then error out with something like "compositor doesn't
+support screencopy". RDP (via KWin's own KRDP server) is the only
+combo that's actually known to work.
+
+EOF
+    choose FIX "Switch to rdp (recommended)" "Continue with $INTERFACE anyway (known broken)" "Abort"
+    case "$FIX" in
+        "Switch to rdp"*) INTERFACE="rdp" ;;
+        "Continue"*) : ;;
+        "Abort") exit 1 ;;
+    esac
+fi
+
+if [[ "$DESKTOP" == "phosh" && "$INTERFACE" == "rdp" ]]; then
+    cat <<EOF
+
+WARNING: Phosh/phoc has no built-in RDP server (nothing equivalent to
+KWin's KRDP). There's no well-supported RDP path for it. Falling back
+to noVNC (wayvnc + a browser client), which does work on phoc.
+
+EOF
+    INTERFACE="novnc"
+fi
 
 echo
-echo "Will install: $DESKTOP + $INTERFACE"
+echo "Installing: $DESKTOP  +  $INTERFACE"
 echo
 
-# ────────────────────────────────────────────────────────────────────
-# 2. VNC password
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
+# 3. credentials (asked up front so the install can run unattended after this)
+# --------------------------------------------------------------------
 
+VNC_USER="$REAL_USER"
 VNC_PASS=""
-while true; do
-    read -rsp "VNC password (min 6 chars, or press Enter for no auth): " VNC_PASS
+if [[ "$INTERFACE" == "novnc" ]]; then
+    read -rsp "Set a password for the VNC/noVNC connection: " VNC_PASS; echo
+fi
+
+# --------------------------------------------------------------------
+# 4. base tools
+# --------------------------------------------------------------------
+
+pkg_update
+pkg_install curl wget gnupg openssl python3 dbus
+pkg_install dbus-user-session 2>/dev/null || true   # Debian/Ubuntu split this out; Fedora/Arch bundle it in 'dbus'
+
+# --------------------------------------------------------------------
+# 5. install the desktop shell
+# --------------------------------------------------------------------
+#
+# Package names/availability here are solid on Ubuntu/Debian. On
+# Fedora and Arch, plasma-mobile and phosh are niche — if pkg_install
+# fails, that almost always means the distro doesn't carry it in its
+# main repos and you'll need a COPR (Fedora) or the AUR (Arch)
+# instead. The script tells you rather than pretending it worked.
+
+install_desktop() {
+    case "$DESKTOP" in
+        plasma-mobile)
+            case "$PKG_MGR" in
+                apt)    pkg_install plasma-mobile kwin-wayland-backend-virtual || return 1 ;;
+                dnf)    pkg_install plasma-mobile kwin || return 1 ;;
+                pacman) pkg_install plasma-mobile kwin || return 1 ;;
+            esac
+            ;;
+        phosh)
+            case "$PKG_MGR" in
+                apt)        pkg_install phosh phosh-core phoc || return 1 ;;
+                dnf|pacman) pkg_install phosh phoc || return 1 ;;
+            esac
+            # squeekboard (on-screen keyboard) isn't always available —
+            # e.g. it has a gap in Ubuntu 24.04's repos. It's a nice-to-have,
+            # not required to get the session up, so don't fail the install
+            # over it.
+            if ! pkg_install squeekboard 2>/dev/null; then
+                echo "Note: squeekboard (on-screen keyboard) isn't available"
+                echo "in this release's repos. You'll need a physical/external"
+                echo "keyboard, or install an on-screen keyboard some other way."
+            fi
+            ;;
+    esac
+    return 0
+}
+if ! install_desktop; then
+    cat <<EOF
+
+Couldn't install $DESKTOP via $PKG_MGR — it isn't in the standard
+repos for this distro/release. On Fedora, look for a plasma-mobile or
+phosh COPR. On Arch, check the AUR (e.g. 'yay -S plasma-mobile' or
+'yay -S phosh'). On Ubuntu/Debian, check you're on a release recent
+enough to carry it (see https://packages.ubuntu.com or
+https://packages.debian.org).
+EOF
+    exit 1
+fi
+
+# --------------------------------------------------------------------
+# 6. install the remote-access backend
+# --------------------------------------------------------------------
+
+install_kasmvnc() {
+    if command -v kasmvncserver &>/dev/null; then
+        echo "kasmvncserver already installed."
+        return
+    fi
+    case "$PKG_MGR" in
+        apt)
+            local codename arch asset_url
+            codename=$(lsb_release -cs)
+            arch=$(dpkg --print-architecture)
+            echo "Looking up the latest KasmVNC .deb for $codename/$arch..."
+            asset_url=$(curl -fsSL https://api.github.com/repos/kasmtech/KasmVNC/releases/latest \
+                | grep -oP '"browser_download_url":\s*"\K[^"]*\.deb' \
+                | grep -i "$codename" | grep -i "$arch" | head -n1 || true)
+            if [[ -z "$asset_url" ]]; then
+                echo "Couldn't auto-detect a matching .deb on the KasmVNC releases"
+                echo "page (https://github.com/kasmtech/KasmVNC/releases). Grab one"
+                echo "manually and install with 'dpkg -i', then re-run pmoiu."
+                exit 1
+            fi
+            wget -O /tmp/kasmvncserver.deb "$asset_url"
+            apt-get install -y /tmp/kasmvncserver.deb
+            ;;
+        dnf)
+            local arch asset_url
+            arch=$(uname -m)
+            echo "Looking up the latest KasmVNC .rpm for $arch..."
+            asset_url=$(curl -fsSL https://api.github.com/repos/kasmtech/KasmVNC/releases/latest \
+                | grep -oP '"browser_download_url":\s*"\K[^"]*\.rpm' \
+                | grep -i "$arch" | head -n1 || true)
+            if [[ -z "$asset_url" ]]; then
+                echo "Couldn't auto-detect a matching .rpm on the KasmVNC releases"
+                echo "page (https://github.com/kasmtech/KasmVNC/releases). Grab one"
+                echo "manually and install with 'dnf install ./file.rpm', then"
+                echo "re-run pmoiu."
+                exit 1
+            fi
+            wget -O /tmp/kasmvncserver.rpm "$asset_url"
+            dnf install -y /tmp/kasmvncserver.rpm
+            ;;
+        pacman)
+            echo "KasmVNC isn't in the official Arch repos — it's on the AUR as"
+            echo "'kasmvnc' or 'kasmvnc-bin'. Install it yourself first (e.g."
+            echo "'yay -S kasmvnc-bin'), then re-run pmoiu."
+            exit 1
+            ;;
+    esac
     echo
-    if [[ -z "$VNC_PASS" ]]; then
-        echo "Warning: no password set — anyone who can reach the port can connect."
-        break
-    elif [[ ${#VNC_PASS} -ge 6 ]]; then
-        break
-    else
-        echo "Password must be at least 6 characters, try again."
-    fi
-done
+    echo "Setting the KasmVNC password for $VNC_USER now (needs -u, or it just prints usage):"
+    as_user "vncpasswd -u '$VNC_USER' -w"
+}
 
-# ────────────────────────────────────────────────────────────────────
-# 3. Refresh package lists
-# ────────────────────────────────────────────────────────────────────
-
-echo
-echo "--- Updating package lists ---"
-apt-get update -qq
-
-# Enable universe repo (needed for phosh, phoc, wayvnc, etc.)
-if ! grep -rq "^deb .*universe" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-    echo "Enabling Ubuntu universe repository..."
-    apt_get software-properties-common
-    add-apt-repository -y universe
-    apt-get update -qq
-fi
-
-# ────────────────────────────────────────────────────────────────────
-# 4. Base dependencies always installed
-# ────────────────────────────────────────────────────────────────────
-
-echo
-echo "--- Installing base dependencies ---"
-apt_get \
-    dbus \
-    dbus-x11 \
-    xauth \
-    x11-utils \
-    curl \
-    wget \
-    openssl \
-    ca-certificates \
-    python3 \
-    lsb-release \
-    iproute2
-
-# websockify bridges WebSocket (browser) → raw TCP (VNC).
-# python3 -m http.server does NOT do this — it only serves static files.
-# Without websockify the noVNC page loads but can never connect.
-apt_get websockify
-
-# noVNC web assets (the browser-side JS/HTML VNC client)
-apt_get novnc
-
-# Confirm assets landed somewhere we can find them
-NOVNC_DIR=""
-for candidate in /usr/share/novnc /usr/share/novnc-core /usr/lib/novnc; do
-    if [[ -f "$candidate/vnc.html" || -f "$candidate/vnc_lite.html" ]]; then
-        NOVNC_DIR="$candidate"
-        break
-    fi
-done
-
-if [[ -z "$NOVNC_DIR" ]]; then
-    echo "apt novnc package installed but web assets not found in expected"
-    echo "locations. Downloading directly from GitHub as fallback..."
-    NOVNC_DIR="/opt/novnc"
-    mkdir -p "$NOVNC_DIR"
-    NOVNC_TAG=$(curl -fsSL https://api.github.com/repos/novnc/noVNC/releases/latest \
-                | grep -oP '"tag_name":\s*"\K[^"]+')
-    wget -q --show-progress \
-        "https://github.com/novnc/noVNC/archive/refs/tags/${NOVNC_TAG}.tar.gz" \
-        -O /tmp/novnc.tar.gz
-    tar -xzf /tmp/novnc.tar.gz -C "$NOVNC_DIR" --strip-components=1
-    rm -f /tmp/novnc.tar.gz
-fi
-
-# Pick the right HTML entry point (package name differs between releases)
-NOVNC_HTML=""
-for f in "$NOVNC_DIR/vnc.html" "$NOVNC_DIR/vnc_lite.html"; do
-    [[ -f "$f" ]] && { NOVNC_HTML="$f"; break; }
-done
-[[ -n "$NOVNC_HTML" ]] || die "noVNC HTML not found under $NOVNC_DIR"
-echo "noVNC assets: $NOVNC_DIR (entry: $(basename "$NOVNC_HTML"))"
-
-# ────────────────────────────────────────────────────────────────────
-# 5. Install the chosen shell
-# ────────────────────────────────────────────────────────────────────
-
-echo
-echo "--- Installing $DESKTOP ---"
-
-case "$DESKTOP" in
-
-    phosh)
-        # phosh and phoc are in Ubuntu 24.04 universe.
-        # squeekboard (on-screen keyboard) is NOT in Ubuntu — Fedora/
-        # postmarketOS only. We skip it explicitly rather than failing.
-        # The shell is fully usable via mouse/touchscreen without it;
-        # for a headless VNC session a physical keyboard works fine.
-        apt_get phosh phoc
-
-        # Nice-to-have extras — all optional, failure is non-fatal
-        apt_get_optional \
-            fonts-cantarell \
-            adwaita-icon-theme \
-            gnome-themes-extra \
-            gsettings-desktop-schemas \
-            xdg-user-dirs
-
-        echo
-        echo "Note: squeekboard (on-screen keyboard) is not packaged for"
-        echo "Ubuntu. Use a hardware keyboard or a VNC client with"
-        echo "built-in keyboard support (e.g. RVNC Viewer, RealVNC)."
-        ;;
-
-    plasma-desktop)
-        # krdp (KWin's built-in RDP server) needs Plasma 6. Ubuntu 24.04
-        # ships Plasma 5. krdp does not exist in the Ubuntu 24.04 repos.
-        #
-        # wlroots VNC (wayvnc) does NOT work on KWin — KWin does not
-        # implement the wlroots screencopy protocol.
-        #
-        # Solution: run Plasma in a plain X11 session under Xvfb (a fake
-        # framebuffer), then capture that with x11vnc. This needs zero
-        # PPAs and works on Ubuntu 24.04 today.
-        apt_get \
-            xvfb \
-            x11vnc \
-            kwin-x11 \
-            plasma-workspace \
-            plasma-desktop \
-            dbus-x11 \
-            fonts-noto-core
-
-        apt_get_optional \
-            plasma-mobile \
-            kde-standard
-        ;;
-esac
-
-# ────────────────────────────────────────────────────────────────────
-# 6. Configure VNC authentication
-# ────────────────────────────────────────────────────────────────────
-
-echo
-echo "--- Configuring VNC authentication ---"
-
-case "$DESKTOP" in
-    phosh)
-        # wayvnc reads a plain text config file
-        WAYVNC_CFG="$REAL_HOME/.config/wayvnc/config"
-        as_user "mkdir -p '$(dirname "$WAYVNC_CFG")'"
-        if [[ -n "$VNC_PASS" ]]; then
-            as_user "cat > '$WAYVNC_CFG' <<CFG
+install_novnc() {
+    pkg_install wayvnc novnc
+    as_user "mkdir -p '$REAL_HOME/.config/wayvnc'"
+    as_user "cat > '$REAL_HOME/.config/wayvnc/config' <<CFG
 address=0.0.0.0
 enable_auth=true
-username=$REAL_USER
+username=$VNC_USER
 password=$VNC_PASS
 CFG"
-        else
-            as_user "cat > '$WAYVNC_CFG' <<CFG
-address=0.0.0.0
-enable_auth=false
-CFG"
-        fi
-        as_user "chmod 600 '$WAYVNC_CFG'"
-        echo "wayvnc config: $WAYVNC_CFG"
-        ;;
+    as_user "chmod 600 '$REAL_HOME/.config/wayvnc/config'"
+}
 
-    plasma-desktop)
-        # x11vnc reads a hashed password file created by x11vnc -storepasswd
-        X11VNC_PASSFILE="$REAL_HOME/.vnc/x11vncpass"
-        as_user "mkdir -p '$REAL_HOME/.vnc'"
-        if [[ -n "$VNC_PASS" ]]; then
-            x11vnc -storepasswd "$VNC_PASS" "$X11VNC_PASSFILE"
-            as_user "chmod 600 '$X11VNC_PASSFILE'"
-            echo "x11vnc password file: $X11VNC_PASSFILE"
-        else
-            echo "No x11vnc password set (unauthenticated)."
-        fi
-        ;;
+install_rdp() {
+    case "$PKG_MGR" in
+        apt)
+            if ! pkg_available krdp; then
+                cat <<EOF
+
+krdp isn't in this Ubuntu/Debian release's repos. It needs Plasma 6,
+and Ubuntu 24.04/22.04 (and Debian bookworm) ship Plasma 5 by
+default. krdp only lands starting with Ubuntu 25.04 (or Debian
+trixie+). Two ways forward:
+
+EOF
+                choose PPA_FIX \
+                    "Add the Kubuntu Backports PPA to get Plasma 6 + krdp (Ubuntu only — upgrades your whole KDE/Plasma stack, can take a while)" \
+                    "Skip RDP — use novnc instead (works today, no stack upgrade)" \
+                    "Abort"
+                case "$PPA_FIX" in
+                    "Add the Kubuntu"*)
+                        if ! command -v lsb_release &>/dev/null || [[ "$(lsb_release -is)" != "Ubuntu" ]]; then
+                            echo "This PPA is Ubuntu-only. On Debian, add the KDE backports"
+                            echo "suite for your release, or install Debian trixie+/sid,"
+                            echo "then re-run pmoiu."
+                            exit 1
+                        fi
+                        pkg_install software-properties-common
+                        add-apt-repository -y ppa:kubuntu-ppa/backports
+                        apt-get update
+                        echo "Upgrading Plasma packages — this can take a while..."
+                        apt-get full-upgrade -y
+                        ;;
+                    "Skip RDP"*)
+                        INTERFACE=novnc
+                        install_novnc
+                        return
+                        ;;
+                    "Abort") exit 1 ;;
+                esac
+            fi
+            pkg_install krdp
+            ;;
+        dnf|pacman)
+            # krdp is a normal, current package on Fedora and Arch since
+            # they ship Plasma 6 already.
+            pkg_install krdp
+            ;;
+    esac
+
+    local krdp_dir="$REAL_HOME/.local/share/krdpserver"
+    as_user "mkdir -p '$krdp_dir'"
+    as_user "openssl req -nodes -new -x509 \
+        -keyout '$krdp_dir/krdp.key' -out '$krdp_dir/krdp.crt' \
+        -days 3650 -batch"
+    as_user "kwriteconfig6 --file krdpserverrc --group General --key Certificate '$krdp_dir/krdp.crt'"
+    as_user "kwriteconfig6 --file krdpserverrc --group General --key CertificateKey '$krdp_dir/krdp.key'"
+    as_user "kwriteconfig6 --file krdpserverrc --group General --key SystemUserEnabled true"
+    echo
+    echo "RDP is set to authenticate with your normal Linux username/password"
+    echo "($VNC_USER) via SystemUserEnabled — no separate RDP password to set."
+}
+
+case "$INTERFACE" in
+    kasmvnc) install_kasmvnc ;;
+    novnc)   install_novnc ;;
+    rdp)     install_rdp ;;
 esac
 
-# ────────────────────────────────────────────────────────────────────
-# 7. Save config for the pmos launcher
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
+# 7. write config for pmos to read later
+# --------------------------------------------------------------------
 
 mkdir -p "$CONFIG_DIR"
 cat > "$CONFIG_FILE" <<EOF
 DESKTOP=$DESKTOP
 INTERFACE=$INTERFACE
 PMOS_USER=$REAL_USER
-PMOS_HOME=$REAL_HOME
 VNC_PORT=$VNC_PORT
 NOVNC_PORT=$NOVNC_PORT
-NOVNC_DIR=$NOVNC_DIR
-NOVNC_HTML=$(basename "$NOVNC_HTML")
+RDP_PORT=$RDP_PORT
+WAYLAND_SOCKET_NAME=wayland-pmos
 EOF
-echo "Config saved: $CONFIG_FILE"
 
-# ────────────────────────────────────────────────────────────────────
-# 8. Write the pmos launcher
-# ────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------
+# 8. generate /usr/local/bin/pmos
+# --------------------------------------------------------------------
 
-cat > "$PMOS_BIN" <<'LAUNCHER'
+cat > "$PMOS_BIN" <<'PMOS_SCRIPT'
 #!/usr/bin/env bash
-# pmos — start the headless mobile session configured by pmoiu
-# Run as your normal user (no sudo).
+#
+# pmos — start the mobile session + remote-access server set up by pmoiu.
+# Generated by pmoiu — edit /etc/pmoiu/config to change desktop/interface,
+# or just re-run pmoiu.
 
 set -uo pipefail
 source /etc/pmoiu/config
 
-# ── Runtime directory ──────────────────────────────────────────────
-# SSH sessions and GitHub Codespaces have no systemd --user session,
-# so XDG_RUNTIME_DIR may be absent or point to a non-existent path.
-# We create a private tmp directory that every child process can use.
-RUNTIME_UID=$(id -u)
-RUNTIME_DIR="/tmp/pmos-runtime-$RUNTIME_UID"
-mkdir -p "$RUNTIME_DIR"
-chmod 0700 "$RUNTIME_DIR"
-export XDG_RUNTIME_DIR="$RUNTIME_DIR"
-
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 PIDS=()
 
 cleanup() {
     echo
-    echo "[pmos] Shutting down..."
-    local pid
+    echo "Stopping pmos..."
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
-    # x11vnc backgrounds itself; kill by name as a backstop
-    pkill -x x11vnc   2>/dev/null || true
-    pkill -x wayvnc   2>/dev/null || true
-    pkill -x websockify 2>/dev/null || true
-    rm -f /tmp/.X99-lock
     exit 0
 }
-trap cleanup INT TERM EXIT
+trap cleanup INT TERM
 
-wait_for_socket() {
-    # wait_for_socket /path/to/socket [timeout]
-    local sock=$1 timeout=${2:-25} elapsed=0
-    echo "[pmos] Waiting for $sock ..."
-    while [[ ! -S "$sock" ]]; do
-        sleep 1
-        elapsed=$((elapsed + 1))
-        if [[ $elapsed -ge $timeout ]]; then
-            echo "[pmos] Timed out waiting for $sock"
-            return 1
+wait_for_wayland_socket() {
+    # Snapshot existing sockets, then wait for a NEW one to appear so we
+    # don't accidentally grab an unrelated compositor's socket.
+    local before after new_sock timeout=20
+    before=$(ls "$RUNTIME_DIR"/wayland-*.lock 2>/dev/null || true)
+    while (( timeout > 0 )); do
+        after=$(ls "$RUNTIME_DIR"/wayland-*.lock 2>/dev/null || true)
+        new_sock=$(comm -13 <(echo "$before" | sort) <(echo "$after" | sort) | head -n1)
+        if [[ -n "$new_sock" ]]; then
+            basename "$new_sock" .lock
+            return 0
         fi
+        sleep 1
+        timeout=$((timeout - 1))
     done
-    echo "[pmos] $sock is ready"
+    echo "" # signal failure with empty output
 }
 
-# ══════════════════════════════════════════════════════════════════
-# Phosh path
-# Compositor: phoc (wlroots, headless backend)
-# VNC:        wayvnc (wlroots screencopy — works on phoc)
-# ══════════════════════════════════════════════════════════════════
-
-start_phosh_session() {
-    echo "[pmos] Starting phoc + phosh (headless Wayland)..."
-
-    # phoc needs a D-Bus session. dbus-run-session creates one for
-    # the lifetime of its child process and exports DBUS_SESSION_BUS_ADDRESS.
-    # We also set WLR_BACKENDS=headless so phoc doesn't try to open /dev/dri.
-    # WLR_LIBINPUT_NO_DEVICES=1 suppresses the "no input devices" error.
-    dbus-run-session -- env \
-        WLR_BACKENDS=headless \
-        WLR_LIBINPUT_NO_DEVICES=1 \
-        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-        XDG_SESSION_TYPE=wayland \
-        WAYLAND_DISPLAY=wayland-0 \
-        phoc -E phosh \
-        &>/tmp/pmos-phosh.log &
+start_plasma_mobile() {
+    export XDG_SESSION_TYPE=wayland
+    export QT_QPA_PLATFORM=wayland
+    # kwin_wayland's --virtual backend is what makes this work without a
+    # physical display. NOTE: startplasmamobile is a wrapper script; on
+    # some package versions it hardcodes "kwin_wayland --drm" instead of
+    # respecting this env var. If the session fails to come up, check
+    # `cat $(command -v startplasmamobile)` and swap --drm for --virtual
+    # by hand, or invoke kwin_wayland yourself with the mobile shell as
+    # its -e/exec argument.
+    export KWIN_WAYLAND_BACKEND=virtual
+    # startplasmamobile needs a session D-Bus. Over plain SSH there usually
+    # isn't one running yet, which is why it silently fails to start —
+    # dbus-run-session gives it a fresh one.
+    dbus-run-session -- startplasmamobile &
     PIDS+=($!)
-
-    wait_for_socket "$XDG_RUNTIME_DIR/wayland-0" 25 || {
-        echo "[pmos] phoc failed to start. Log:"
-        tail -20 /tmp/pmos-phosh.log
-        exit 1
-    }
-
-    export WAYLAND_DISPLAY=wayland-0
-}
-
-start_wayvnc() {
-    echo "[pmos] Starting wayvnc on $WAYLAND_DISPLAY port $VNC_PORT..."
-    env \
-        WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
-        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-    wayvnc \
-        --config="$HOME/.config/wayvnc/config" \
-        0.0.0.0 "$VNC_PORT" \
-        &>/tmp/pmos-wayvnc.log &
-    PIDS+=($!)
-    sleep 2
-
-    # Confirm it's listening
-    if ! ss -tlnp 2>/dev/null | grep -q ":$VNC_PORT " && \
-       ! netstat -tlnp 2>/dev/null | grep -q ":$VNC_PORT "; then
-        echo "[pmos] Warning: wayvnc may not have bound to port $VNC_PORT"
-        echo "       Check /tmp/pmos-wayvnc.log for details"
+    WAYLAND_DISPLAY=$(wait_for_wayland_socket)
+    if [[ -z "$WAYLAND_DISPLAY" ]]; then
+        echo "Plasma Mobile's Wayland socket never appeared. See the note"
+        echo "above about startplasmamobile's hardcoded backend flag."
+        cleanup
     fi
+    export WAYLAND_DISPLAY
 }
 
-# ══════════════════════════════════════════════════════════════════
-# Plasma Desktop path  (Xvfb + kwin_x11 + plasmashell + x11vnc)
-#
-# Why Xvfb instead of Wayland?
-#   krdp (KWin's RDP server) needs Plasma 6 — not in Ubuntu 24.04.
-#   wayvnc needs wlroots screencopy — KWin doesn't implement it.
-#   Xvfb gives us a real framebuffer that x11vnc can capture with
-#   zero extra dependencies or PPAs.
-# ══════════════════════════════════════════════════════════════════
-
-XDISPLAY=":99"
-
-start_plasma_session() {
-    # Remove stale lock from a previous run
-    rm -f "/tmp/.X${XDISPLAY#:}-lock"
-
-    echo "[pmos] Starting Xvfb on DISPLAY=$XDISPLAY (1080×1920)..."
-    Xvfb "$XDISPLAY" -screen 0 1080x1920x24 -ac &
-    PIDS+=($!)
-    sleep 2
-
-    export DISPLAY="$XDISPLAY"
-
-    echo "[pmos] Starting kwin_x11 inside a D-Bus session..."
-    dbus-run-session -- env \
-        DISPLAY="$XDISPLAY" \
-        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-        XDG_SESSION_TYPE=x11 \
-        kwin_x11 \
-        &>/tmp/pmos-kwin.log &
+start_phosh() {
+    export WLR_BACKENDS=headless
+    export WLR_LIBINPUT_NO_DEVICES=1
+    export WAYLAND_DISPLAY="$WAYLAND_SOCKET_NAME"
+    # -E tells phoc what to run as the shell client. If your distro's
+    # phoc.ini is somewhere non-default, add: -C /etc/phosh/phoc.ini
+    # phoc/phosh also want a session D-Bus, same reasoning as above.
+    dbus-run-session -- phoc -E phosh &
     PIDS+=($!)
     sleep 3
-
-    echo "[pmos] Starting plasmashell..."
-    dbus-run-session -- env \
-        DISPLAY="$XDISPLAY" \
-        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-        XDG_SESSION_TYPE=x11 \
-        plasmashell \
-        &>/tmp/pmos-plasmashell.log &
-    PIDS+=($!)
-    sleep 4
-
-    # Launch plasma-mobile on top if available
-    if command -v plasma-mobile &>/dev/null; then
-        echo "[pmos] Launching plasma-mobile shell layer..."
-        dbus-run-session -- env \
-            DISPLAY="$XDISPLAY" \
-            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-        plasma-mobile \
-            &>/tmp/pmos-plasma-mobile.log &
-        PIDS+=($!)
-        sleep 2
+    if [[ ! -S "$RUNTIME_DIR/$WAYLAND_DISPLAY" ]]; then
+        echo "phoc's Wayland socket never appeared — check 'journalctl' or"
+        echo "run 'phoc -E phosh' in the foreground to see the real error."
+        cleanup
     fi
-
-    echo "[pmos] Plasma session running on DISPLAY=$XDISPLAY"
 }
 
-start_x11vnc() {
-    local passfile="$HOME/.vnc/x11vncpass"
-    local auth_args
-
-    if [[ -f "$passfile" ]]; then
-        auth_args="-rfbauth $passfile"
-    else
-        auth_args="-nopw"
-        echo "[pmos] No x11vnc password file found — running unauthenticated"
-    fi
-
-    echo "[pmos] Starting x11vnc on DISPLAY=$XDISPLAY port $VNC_PORT..."
-    # shellcheck disable=SC2086
-    x11vnc \
-        -display "$XDISPLAY" \
-        -rfbport "$VNC_PORT" \
-        $auth_args \
-        -forever \
-        -shared \
-        -noxdamage \
-        -noscr \
-        -o /tmp/pmos-x11vnc.log \
-        &
-    PIDS+=($!)
-    sleep 2
+start_kasmvnc() {
+    echo "Starting KasmVNC (this manages its OWN X session — it will NOT show"
+    echo "you $DESKTOP; see the warning pmoiu printed at install time)..."
+    vncserver -select-de manual
+    echo "Connect with a VNC client to <this-host>:$VNC_PORT"
 }
-
-# ══════════════════════════════════════════════════════════════════
-# websockify + noVNC (shared by both paths)
-# ══════════════════════════════════════════════════════════════════
 
 start_novnc() {
-    # Resolve web assets directory (recorded at install time, but verify)
-    local web_dir="${NOVNC_DIR:-}"
-    local html_file="${NOVNC_HTML:-vnc.html}"
-
-    if [[ -z "$web_dir" || ! -f "$web_dir/$html_file" ]]; then
-        # Search common locations
-        local d
-        for d in /usr/share/novnc /usr/lib/novnc /opt/novnc /usr/share/novnc-core; do
-            if [[ -f "$d/vnc.html" || -f "$d/vnc_lite.html" ]]; then
-                web_dir="$d"
-                html_file=$(ls "$d/vnc.html" "$d/vnc_lite.html" 2>/dev/null | head -1 | xargs basename)
-                break
-            fi
-        done
-    fi
-
-    if [[ -z "$web_dir" ]]; then
-        echo "[pmos] ERROR: noVNC web assets not found."
-        echo "       Install with: apt-get install novnc"
-        echo "       Then rerun: pmos"
-        exit 1
-    fi
-
-    echo "[pmos] Starting websockify: port $NOVNC_PORT → 127.0.0.1:$VNC_PORT"
-    echo "       Serving noVNC assets from $web_dir"
-
-    websockify \
-        --web "$web_dir" \
-        --heartbeat 30 \
-        "$NOVNC_PORT" \
-        "127.0.0.1:$VNC_PORT" \
-        &>/tmp/pmos-websockify.log &
+    echo "Starting wayvnc..."
+    wayvnc -w -C "$HOME/.config/wayvnc/config" 0.0.0.0 "$VNC_PORT" &
     PIDS+=($!)
-    sleep 2
-
-    # Print access instructions
-    local ip
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{print $7}' | head -1)
-    ip="${ip:-127.0.0.1}"
-
+    echo "Serving the noVNC web client on port $NOVNC_PORT..."
+    ( cd /usr/share/novnc && python3 -m http.server "$NOVNC_PORT" ) &
+    PIDS+=($!)
+    IP=$(hostname -I | awk '{print $1}')
     echo
-    echo "┌─────────────────────────────────────────────────────┐"
-    echo "│              pmos session is running                │"
-    echo "├─────────────────────────────────────────────────────┤"
-    printf "│  Browser URL : http://%-30s│\n" "$ip:$NOVNC_PORT/$html_file"
-    printf "│  Raw VNC     : %-36s│\n" "$ip:$VNC_PORT"
-    echo "├─────────────────────────────────────────────────────┤"
-    echo "│  SSH tunnel (keeps traffic off the open internet):  │"
-    printf "│  ssh -L %s:127.0.0.1:%s user@%-14s│\n" \
-        "$NOVNC_PORT" "$NOVNC_PORT" "$ip"
-    echo "│  Then open: http://127.0.0.1:$NOVNC_PORT/$html_file"
-    echo "├─────────────────────────────────────────────────────┤"
-    echo "│  Logs:                                              │"
-    case "$DESKTOP" in
-        phosh)          echo "│  /tmp/pmos-phosh.log  /tmp/pmos-wayvnc.log          │" ;;
-        plasma-desktop) echo "│  /tmp/pmos-kwin.log   /tmp/pmos-x11vnc.log          │" ;;
-    esac
-    echo "│  /tmp/pmos-websockify.log                           │"
-    echo "└─────────────────────────────────────────────────────┘"
+    echo "Open in a browser: http://$IP:$NOVNC_PORT/vnc.html?host=$IP&port=$VNC_PORT"
+    echo "(Prefer tunneling this over SSH rather than exposing it directly.)"
 }
 
-# ── Main ──────────────────────────────────────────────────────────
+start_rdp() {
+    echo "Starting krdpserver..."
+    krdpserver &
+    PIDS+=($!)
+    IP=$(hostname -I | awk '{print $1}')
+    echo "Connect with an RDP client (Remmina, xfreerdp, mstsc) to $IP:$RDP_PORT"
+    echo "Log in with your normal Linux username ($PMOS_USER) and password."
+}
 
 echo "=== pmos: starting $DESKTOP + $INTERFACE ==="
-echo
 
 case "$DESKTOP" in
-    phosh)
-        start_phosh_session
-        start_wayvnc
-        ;;
-    plasma-desktop)
-        start_plasma_session
-        start_x11vnc
-        ;;
+    plasma-mobile) start_plasma_mobile ;;
+    phosh)         start_phosh ;;
 esac
 
-# Both paths end with websockify + noVNC
-start_novnc
+case "$INTERFACE" in
+    kasmvnc) start_kasmvnc ;;
+    novnc)   start_novnc ;;
+    rdp)     start_rdp ;;
+esac
 
 echo
-echo "[pmos] Press Ctrl+C to stop the session."
+echo "pmos is running. Press Ctrl+C to stop everything."
 wait
-LAUNCHER
+PMOS_SCRIPT
 
 chmod +x "$PMOS_BIN"
 
-# ────────────────────────────────────────────────────────────────────
-# Done
-# ────────────────────────────────────────────────────────────────────
-
 echo
-echo "┌─────────────────────────────────────────────────────┐"
-echo "│              pmoiu install complete                 │"
-echo "├─────────────────────────────────────────────────────┤"
-printf "│  Shell     : %-38s│\n" "$DESKTOP"
-printf "│  Interface : %-38s│\n" "$INTERFACE (noVNC via websockify)"
-printf "│  User      : %-38s│\n" "$REAL_USER"
-echo "├─────────────────────────────────────────────────────┤"
-echo "│  To start the session (no sudo needed):             │"
-echo "│    pmos                                             │"
-echo "│  To change settings re-run:                         │"
-echo "│    sudo ./pmoiu                                     │"
-echo "└─────────────────────────────────────────────────────┘"
+echo "=== Done ==="
+echo "Installed: $DESKTOP + $INTERFACE"
+echo "Run 'pmos' (as $REAL_USER, no sudo needed) to start the session."
+if [[ "$INTERFACE" == "rdp" || "$DESKTOP" == "plasma-mobile" ]]; then
+    echo "Make sure port $RDP_PORT/tcp is reachable (or tunnel it over SSH)."
+fi
+if [[ "$INTERFACE" == "novnc" ]]; then
+    echo "Make sure ports $VNC_PORT and $NOVNC_PORT/tcp are reachable (or tunnel over SSH)."
+fi
