@@ -14,6 +14,14 @@
 # so on those distros the script tells you plainly if a package isn't
 # found instead of guessing a name that doesn't exist.
 #
+# There's also a second path: downloading a REAL postmarketOS
+# environment via pmbootstrap instead of native packages. This matters
+# because postmarketOS uses apk (from Alpine), but its plasma-mobile/
+# phosh packages live in postmarketOS's OWN repo — plain Alpine's repos
+# don't have them, so a plain "docker run alpine && apk add
+# plasma-mobile" won't work. pmbootstrap knows the real mirrors/keys
+# and targets your actual detected architecture (nothing hardcoded).
+#
 # ---------------------------------------------------------------------
 # READ THIS FIRST — compatibility reality check
 # ---------------------------------------------------------------------
@@ -126,6 +134,89 @@ echo "=== pmoiu — install a mobile shell ($PKG_MGR detected) ==="
 echo
 echo "Which mobile shell do you want?"
 choose DESKTOP "plasma-mobile" "phosh"
+
+echo
+echo "How do you want to get $DESKTOP?"
+choose SOURCE \
+    "Native $PKG_MGR packages on this system (current host, headless hacks needed)" \
+    "Download a real postmarketOS environment via pmbootstrap (boots in QEMU — sidesteps most of the headless GPU/dmabuf pain, since QEMU gives it a virtual GPU)"
+
+if [[ "$SOURCE" == Download* ]]; then
+    HOST_ARCH=$(uname -m)
+    echo
+    echo "Detected host architecture: $HOST_ARCH (not hardcoded — pmbootstrap"
+    echo "will offer you devices/architectures based on what it detects too)."
+    pkg_install git python3 python3-pip openssl qemu-system-"$HOST_ARCH" 2>/dev/null \
+        || pkg_install git python3 python3-pip openssl qemu
+    if ! as_user "command -v pmbootstrap" &>/dev/null; then
+        echo "Installing pmbootstrap for $VNC_USER via pip..."
+        as_user "pip install --user pmbootstrap --break-system-packages" \
+            || as_user "pip install --user pmbootstrap"
+    fi
+    cat <<EOF
+
+pmbootstrap will now ask a series of questions (this is interactive —
+we deliberately don't script past it, since guessing the right
+device/UI answers for your specific architecture would mean hardcoding
+exactly what you asked us not to). When it asks, pick:
+  release channel: your choice (edge = latest, or a stable vN.NN)
+  vendor:          generic
+  device:          whichever entry matches $HOST_ARCH
+  UI:              $DESKTOP
+
+EOF
+    as_user "pmbootstrap init"
+    echo
+    echo "Fetching/building the image — this can take a while..."
+    as_user "pmbootstrap install"
+
+    IMG=$(as_user "find \$HOME/.local/var/pmbootstrap \$HOME/.cache/pmbootstrap 2>/dev/null -maxdepth 6 \( -iname '*.img' -o -iname '*.qcow2' \) -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-" 2>/dev/null || true)
+
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+DESKTOP=$DESKTOP
+SOURCE=pmbootstrap
+HOST_ARCH=$HOST_ARCH
+PMOS_USER=$REAL_USER
+PMOS_IMAGE=$IMG
+EOF
+
+    cat > "$PMOS_BIN" <<'PMOS_SCRIPT'
+#!/usr/bin/env bash
+# pmos — boot the postmarketOS image pmoiu downloaded, with QEMU's own
+# VNC output (this is QEMU's virtual-machine display, separate from
+# wayvnc/kasmvnc — it works regardless of what's running inside the VM).
+set -uo pipefail
+source /etc/pmoiu/config
+
+if [[ -z "${PMOS_IMAGE:-}" || ! -f "$PMOS_IMAGE" ]]; then
+    echo "Couldn't find the built image automatically."
+    echo "Look for it yourself under ~/.local/var/pmbootstrap (or wherever"
+    echo "'pmbootstrap config work' points), and either boot it with:"
+    echo "  qemu-system-$HOST_ARCH -m 2048 -drive file=<path>,format=raw -vnc :1"
+    echo "or just run 'pmbootstrap qemu' for the normal (local-display) launcher."
+    exit 1
+fi
+
+echo "Booting $PMOS_IMAGE with QEMU (VNC display :1 -> port 5901)..."
+echo "This is QEMU's own VNC output, not wayvnc/kasmvnc — connect any VNC"
+echo "client to <this-host>:5901 once it's booted."
+qemu-system-"$HOST_ARCH" \
+    -m 2048 \
+    -drive file="$PMOS_IMAGE",format=raw \
+    -vnc :1
+PMOS_SCRIPT
+    chmod +x "$PMOS_BIN"
+
+    echo
+    echo "=== Done ==="
+    echo "Run 'pmos' (as $REAL_USER) to boot it. First boot inside pmOS still"
+    echo "needs its own setup (network, maybe 'apk add wayvnc' if you'd rather"
+    echo "use Wayland-native VNC from inside the guest instead of QEMU's)."
+    echo "If the auto-detected image path is wrong, edit PMOS_IMAGE in"
+    echo "$CONFIG_FILE by hand."
+    exit 0
+fi
 
 echo
 echo "Which remote-access method do you want to interface it with?"
@@ -420,6 +511,9 @@ set -uo pipefail
 source /etc/pmoiu/config
 
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+export XDG_RUNTIME_DIR="$RUNTIME_DIR"
 PIDS=()
 
 cleanup() {
@@ -477,6 +571,10 @@ start_plasma_mobile() {
 
 start_phosh() {
     export WLR_BACKENDS=headless
+    # Hosts with no GPU (or no accessible DRM render node) can't do
+    # dmabuf-based GPU rendering — fall back to wlroots' software (pixman)
+    # renderer so phoc doesn't just fail to start.
+    export WLR_RENDERER=pixman
     export WLR_LIBINPUT_NO_DEVICES=1
     export WAYLAND_DISPLAY="$WAYLAND_SOCKET_NAME"
     # -E tells phoc what to run as the shell client. If your distro's
