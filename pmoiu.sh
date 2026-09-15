@@ -1,3 +1,5 @@
+
+l
 #!/usr/bin/env bash
 #
 # pmoiu — PostmarketOS in Ubuntu (installer)
@@ -147,7 +149,7 @@ if [[ "$SOURCE" == Download* ]]; then
     echo "Detected host architecture: $HOST_ARCH (not hardcoded — pmbootstrap"
     echo "will offer you devices/architectures based on what it detects too)."
     pkg_install git python3 python3-pip openssl qemu-system-"$HOST_ARCH" 2>/dev/null \
-        || pkg_install git python3 python3-pip openssl qemu
+        || pkg_install git python3 python3-pip openssl
     if ! as_user "command -v pmbootstrap" &>/dev/null; then
         echo "Installing pmbootstrap for $VNC_USER via pip..."
         as_user "pip install --user pmbootstrap --break-system-packages" \
@@ -580,12 +582,12 @@ start_phosh() {
     # -E tells phoc what to run as the shell client. If your distro's
     # phoc.ini is somewhere non-default, add: -C /etc/phosh/phoc.ini
     # phoc/phosh also want a session D-Bus, same reasoning as above.
-    dbus-run-session -- phoc -E phosh &
+    dbus-run-session -- phoc -E phosh-session &
     PIDS+=($!)
     sleep 3
     if [[ ! -S "$RUNTIME_DIR/$WAYLAND_DISPLAY" ]]; then
         echo "phoc's Wayland socket never appeared — check 'journalctl' or"
-        echo "run 'phoc -E phosh' in the foreground to see the real error."
+        echo "run 'phoc -E phosh-session' in the foreground to see the real error."
         cleanup
     fi
 }
