@@ -1,10 +1,8 @@
-
-l
 #!/usr/bin/env bash
 #
 # pmoiu — PostmarketOS in Ubuntu (installer)
 #
-# Installs a mobile Linux shell (Plasma Mobile or Phosh) plus a
+# Installs a mobile Linux shell (Plasma Mobile or phosh) plus a
 # remote-access backend (KasmVNC, noVNC, or RDP), and drops a "pmos"
 # launcher in /usr/local/bin that starts the session + server
 # headlessly (no physical display needed — works fine over plain SSH).
